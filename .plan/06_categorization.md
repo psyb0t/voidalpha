@@ -1,0 +1,227 @@
+# 06 — Categorization & Linking
+
+Taxonomy engine that auto-tags data events with tickers, sectors, asset classes, and regions. Cross-references events to build correlation signals.
+
+## Services in This Phase
+
+| Service | Task Queue | Schedule |
+|---------|-----------|----------|
+| `categorizer` | `categorizer-queue` | Triggered by NOTIFY + every 5 min sweep |
+
+---
+
+## 6.1 — categorizer Service
+
+### What It Does
+The **single point for all AI processing**. No other service calls Claude — they just write raw events to the DB. The categorizer picks them up and does everything:
+
+1. Runs event through Claude Haiku (docker-claude-code) for analysis
+2. Extracts tickers, sectors, asset classes, regions
+3. Classifies urgency (routine/notable/alert)
+4. Determines sentiment (bullish/bearish/neutral)
+5. Summarizes content (news articles, Fed speeches, etc.)
+6. Scores Fed speeches hawkish/dovish
+7. Writes tags to `data_event_tags` table
+8. Updates event fields (summary, urgency) in `data_events` if needed
+9. Detects cross-service correlations
+
+### AI Categorization (docker-claude-code + Haiku)
+
+Uses the api-gateway export endpoints to fetch data, writes it to temp files, mounts into the docker-claude-code container. Claude reads input files, writes output files. No fallback — if Claude fails, Temporal retries. Untagged events sit in the DB until the sweep picks them up.
+
+**Flow**:
+```
+1. Categorizer calls GET /api/export/events?untagged=true&limit=50
+2. Writes response to /tmp/voidalpha/input/events.json
+3. Writes prompt to /tmp/voidalpha/input/prompt.md
+4. docker run --rm \
+     -e CLAUDE_CODE_OAUTH_TOKEN="$TOKEN" \
+     -v /tmp/voidalpha/input:/data/input:ro \
+     -v /tmp/voidalpha/output:/data/output \
+     psyb0t/claude-code:latest \
+     -p "Read /data/input/prompt.md for instructions. Read events from /data/input/events.json. Write results to /data/output/results.json" \
+     --output-format json --model haiku
+5. Read /tmp/voidalpha/output/results.json
+6. Update DB: write tags to data_event_tags, update summaries/urgency in data_events
+7. Clean up temp files
+```
+
+**General categorization prompt** (`prompt.md`):
+```
+You are a financial data categorizer for swing traders.
+Read the events in /data/input/events.json (JSON array).
+
+For each event, output a JSON object in /data/output/results.json (JSON array) with:
+- id: the event id (from input)
+- summary: 2-3 sentence summary
+- tickers: list of relevant stock tickers (be precise, no false positives)
+- sectors: list of sectors (technology, finance, energy, healthcare, defense, consumer, industrials, etc.)
+- asset_class: equity, commodity, crypto, forex, bond, or index
+- region: US, EU, Asia, or global
+- urgency: routine, notable, or alert (considering market impact for swing traders)
+- sentiment: bullish, bearish, or neutral
+```
+
+**Fed speech prompt** (when batch contains `source_service = 'fed-watcher'` with speech text):
+```
+Additional fields for Fed speeches:
+- hawkish_score: float -1.0 (ultra-dovish) to +1.0 (ultra-hawkish)
+- key_phrases: list of significant phrases
+- policy_signals: any hints about future rate decisions
+- market_impact: expected reaction (bullish/bearish/neutral for equities, bonds, dollar)
+```
+
+**Batching**: Process up to 50 events per Claude call. The export endpoint already supports `limit` param. One container spin-up per batch.
+
+### Two Operating Modes
+
+#### Real-time Mode (NOTIFY-driven)
+- LISTENs on `data_events` channel
+- On each notification, fetches the new event and runs it through Claude Haiku
+- Low latency: events are tagged within seconds of insertion (if Claude is up)
+
+#### Sweep Mode (cron, catches everything)
+- Every 5 min, queries `data_events` where no tags exist in `data_event_tags`
+- Catches any events that were missed by NOTIFY (e.g., during restart)
+- Also re-tags events if taxonomy changes
+
+### Ticker Extraction
+
+Uses the shared `tagger` package from `internal/pkg/tagger/`.
+
+**Extraction rules**:
+1. **Explicit tickers**: Match `$AAPL` or known ticker patterns (1-5 uppercase letters)
+2. **Company names**: Map common company names to tickers (`"Apple" → AAPL`, `"Tesla" → TSLA`, `"Microsoft" → MSFT`)
+3. **Index references**: Map index names (`"S&P 500" → ^GSPC`, `"Nasdaq" → ^IXIC`, `"Dow" → ^DJI`)
+4. **Commodity references**: `"gold" → GC=F`, `"oil" / "crude" → CL=F`, `"natural gas" → NG=F`
+5. **Crypto references**: `"bitcoin" / "BTC" → BTC-USD`, `"ethereum" / "ETH" → ETH-USD`
+
+**False positive filtering**:
+- Skip common English words that happen to be tickers: `A`, `I`, `IT`, `ALL`, `ARE`, `BE`, `CAN`, `DO`, `FOR`, `HAS`, `KEY`, `NOW`, `ON`, `SO`, `TRUE`, `US`
+- Require at least 2 characters for ticker matches without `$` prefix
+- Only match against a known ticker universe (loaded from Finnhub/Polygon reference data)
+
+### Sector & Asset Class Mapping
+
+Maintain a local mapping table (loaded at startup, refreshed daily):
+
+| Tag Type | Source |
+|----------|--------|
+| `sector` | Finnhub: `GET /stock/profile2?symbol=AAPL` → `finnhubIndustry` field |
+| `asset_class` | Derived from ticker format: equities (`AAPL`), commodities (`GC=F`), crypto (`BTC-USD`), indices (`^GSPC`) |
+| `region` | Inferred from three levels: (1) source provides it (Finnhub `country` field, NewsAPI `country` param), (2) source is inherently region-specific (FRED/BLS/SEC/FINRA/Capitol Trades/CBOE/Treasury = US), (3) Claude Haiku determines it for general news feeds (Reuters World, AP, BBC). Phase 1 data is mostly US but tagging assigns correct regions so filtering works when we expand. |
+
+**Sector normalization** (map Finnhub industries to our categories):
+
+```
+"Technology" → "technology"
+"Financial Services" / "Banking" → "finance"
+"Healthcare" / "Biotechnology" → "healthcare"
+"Energy" / "Oil & Gas" → "energy"
+"Aerospace & Defense" → "defense"
+"Consumer Cyclical" / "Consumer Defensive" → "consumer"
+"Industrials" → "industrials"
+"Real Estate" → "real_estate"
+"Utilities" → "utilities"
+"Communication Services" → "communication"
+"Basic Materials" → "materials"
+```
+
+### Cross-Reference / Correlation Detection
+
+After tagging, check for temporal correlations:
+
+1. **Insider + Earnings**: Insider buy within 30 days of earnings → generate correlation event
+2. **Congress + Committee**: Congress member trade in sector their committee oversees → flag
+3. **Short Interest + News**: High short interest ticker appears in breaking news → flag
+4. **Options + Earnings**: Unusual options activity within 7 days of earnings → flag
+5. **Macro + Market**: Major macro release (CPI, FOMC) within 24h → link to market moves
+
+Correlation events written to `data_events` with `source_service: 'categorizer'`, `category: 'correlation'`.
+
+### Temporal Workflows
+
+```
+TagEventWorkflow (triggered by NOTIFY, not cron)
+  → FetchEventActivity(eventID) → DataEvent
+  → ExtractTickersActivity(event) → []string
+  → LookupSectorsActivity(tickers) → map[string]SectorInfo
+  → WriteTagsActivity(eventID, tags)
+
+SweepUntaggedWorkflow (cron: every 5 min)
+  → QueryUntaggedEventsActivity(limit: 100) → []DataEvent
+  → For each: ExtractTickersActivity + LookupSectorsActivity + WriteTagsActivity
+
+CorrelationWorkflow (cron: every 15 min)
+  → QueryRecentEventsActivity(window: 24h) → []DataEvent with tags
+  → DetectCorrelationsActivity(events) → []Correlation
+  → WriteDataEventsActivity(correlations)
+
+RefreshTaxonomyWorkflow (cron: every 24 hours)
+  → FetchTickerUniverseActivity() → []TickerInfo  // from Finnhub/Polygon
+  → UpdateLocalMappingsActivity(tickers)
+```
+
+### Shared `tagger` Package
+
+Located at `internal/pkg/tagger/`. Used by categorizer and optionally by other services for inline tagging.
+
+```go
+// Package tagger extracts financial entities from text
+package tagger
+
+type Tag struct {
+    Type  string // "ticker", "sector", "asset_class", "region"
+    Value string // "AAPL", "technology", "equity", "US"
+}
+
+type Tagger struct {
+    tickerUniverse map[string]TickerInfo
+    companyNames   map[string]string  // "Apple" → "AAPL"
+    stopWords      map[string]bool
+}
+
+func New(universe []TickerInfo) *Tagger
+func (t *Tagger) ExtractTags(text string) []Tag
+func (t *Tagger) RefreshUniverse(universe []TickerInfo)
+```
+
+### Config
+
+```go
+type Config struct {
+    FinnhubAPIKey      string `env:"FINNHUB_API_KEY"`
+    SweepInterval      string `env:"CATEGORIZER_SWEEP_INTERVAL" default:"5m"`
+    CorrelationWindow  string `env:"CATEGORIZER_CORRELATION_WINDOW" default:"24h"`
+}
+```
+
+### Data Written
+
+Table: `data_event_tags`
+- `event_id`, `tag_type`, `tag_value`
+- Examples for a single event:
+  - `(123, "ticker", "AAPL")`
+  - `(123, "sector", "technology")`
+  - `(123, "asset_class", "equity")`
+  - `(123, "region", "US")`
+
+Table: `data_events` (correlation events)
+- `source_service`: `'categorizer'`
+- `category`: varies
+- Examples:
+  - `title: "Correlation: NVDA insider buy + earnings in 5 days"`, `body: {"type": "insider_earnings", "ticker": "NVDA", "insider_event_id": 456, "earnings_date": "2026-03-17", "days_until_earnings": 5}`
+  - `title: "Correlation: Congress cluster buy in defense + FOMC meeting tomorrow"`, `body: {"type": "congress_macro", "sector": "defense", "congress_event_ids": [789, 790], "macro_event": "FOMC"}`
+
+---
+
+## 6.2 — Deliverables
+
+After this phase:
+- [ ] `categorizer` service auto-tagging all events with tickers, sectors, asset classes, regions
+- [ ] Shared `tagger` package extracting financial entities from text
+- [ ] Ticker universe loaded from Finnhub/Polygon, refreshed daily
+- [ ] False positive filtering (stop words, known ticker universe)
+- [ ] Cross-service correlation detection (insider+earnings, congress+committee, etc.)
+- [ ] All events in `data_event_tags` table, queryable by any tag combination
+- [ ] Frontend can filter by ticker/sector/asset_class/region
