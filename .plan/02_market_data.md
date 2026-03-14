@@ -66,12 +66,12 @@ Fetches real-time/delayed stock quotes, index values, commodity prices, and cryp
 
 ```
 QuoteFetchWorkflow (cron: every 2 min)
-  → FetchQuotesActivity(tickers []string) → []Quote
-  → WriteSnapshotsActivity(quotes []Quote)
+  → FetchQuotes(tickers []string) → []Quote
+  → WriteSnapshots(quotes []Quote)
 
 CandleFetchWorkflow (cron: every 15 min)
-  → FetchCandlesActivity(ticker, resolution, from, to) → []Candle
-  → WriteCandlesActivity(candles []Candle)
+  → FetchCandles(ticker, resolution, from, to) → []Candle
+  → WriteCandles(candles []Candle)
 ```
 
 **Retry Policy**: 3 attempts, initial interval 5s, backoff coefficient 2.0, max interval 30s.
@@ -90,11 +90,14 @@ type Config struct {
 
 ### Data Written
 
-Table: `market_snapshots`
+Table: `market_snapshots` (UUID primary key)
 - `ticker`, `price`, `change_pct`, `volume`
 - `extra` JSONB: `{"open": X, "high": X, "low": X, "prev_close": X, "bid": X, "ask": X, "source": "finnhub"}`
+- Dedup: `UNIQUE` constraint on `source_id` at this table level
 
-Also writes to `data_events` for significant moves (>2% change triggers `urgency: notable`, >5% triggers `urgency: alert`).
+After each write, publishes to NATS JetStream subject `snapshots.{ticker}` with inline price data: `{"id": "uuid", "ticker": "SPY", "price": 520.50, "change_pct": -1.2}` (no DB lookup needed by consumers).
+
+For significant moves (>2% change = notable, >5% = alert), publishes to NATS JetStream subject `events.market_snapshots` with `{"id": "uuid", "table": "market_snapshots"}` payload and appropriate urgency metadata.
 
 ---
 
@@ -170,15 +173,15 @@ If gamma is not provided by the data source (e.g., Yahoo Finance), it can be com
 
 ```
 OptionsChainWorkflow (cron: every 15 min, market hours only)
-  → FetchExpirationsActivity(ticker) → []date
-  → FetchChainActivity(ticker, expiration) → []OptionContract
-  → WriteOptionsFlowActivity(contracts)
-  → ComputeGammaActivity(ticker, contracts, spotPrice) → GammaExposure
-  → WriteGammaActivity(gex)
+  → FetchExpirations(ticker) → []date
+  → FetchChain(ticker, expiration) → []OptionContract
+  → WriteOptionsFlow(contracts)
+  → ComputeGamma(ticker, contracts, spotPrice) → GammaExposure
+  → WriteGamma(gex)
 
 UnusualActivityWorkflow (cron: every 30 min, market hours only)
-  → ScrapeUnusualActivity() → []UnusualOption
-  → WriteDataEventsActivity(events)  // category: 'options', urgency based on volume
+  → ScrapeUnusual() → []UnusualOption
+  → PublishNATS(events)  // publish to events.options_flow
 ```
 
 **Market hours check**: Skip execution if outside 9:30 AM – 4:00 PM ET on weekdays.
@@ -197,20 +200,24 @@ type Config struct {
 
 ### Data Written
 
-Table: `options_flow`
+Table: `options_flow` (UUID primary key)
 - `ticker`, `expiry`, `strike`, `option_type`, `volume`, `open_interest`, `implied_vol`, `delta`, `gamma`
 - `extra` JSONB: `{"theta": X, "vega": X, "bid": X, "ask": X, "last": X, "source": "tradier"}`
+- Dedup: `UNIQUE` constraint on `source_id` at this table level
 
-Table: `gamma_exposure`
+Table: `gamma_exposure` (UUID primary key)
 - `ticker`, `spot_price`, `total_gex`, `call_gex`, `put_gex`, `max_pain`
 - `gex_by_strike` JSONB: `[{"strike": 500, "gex": 1234567}, ...]`
+- Dedup: `UNIQUE` constraint on `source_id` at this table level
+
+Unusual options activity publishes to NATS JetStream subject `events.options_flow` with `{"id": "uuid", "table": "options_flow"}` payload.
 
 ---
 
 ## 2.3 — earnings-calendar Service
 
 ### What It Does
-Tracks upcoming and recent earnings reports, EPS estimates vs actuals. Writes to `data_events` with `category: 'earnings'`.
+Tracks upcoming and recent earnings reports, EPS estimates vs actuals. Writes to `earnings_reports` table, then publishes to NATS JetStream.
 
 ### Data Sources
 
@@ -228,25 +235,27 @@ Tracks upcoming and recent earnings reports, EPS estimates vs actuals. Writes to
 
 ```
 EarningsCalendarWorkflow (cron: every 6 hours)
-  → FetchEarningsActivity(from, to) → []EarningsReport
-  → DeduplicateActivity(reports) → []EarningsReport  // check source_id
-  → WriteDataEventsActivity(reports)
+  → FetchEarnings(from, to) → []EarningsReport
+  → Deduplicate(reports) → []EarningsReport  // check source_id UNIQUE at earnings_reports table level
+  → WriteEarningsReports(reports)
+  → PublishNATS(reports)  // publish to events.earnings_reports
 
 EarningsSurpriseWorkflow (cron: every 1 hour during earnings season)
-  → FetchRecentEarningsActivity() → []EarningsReport
-  → CheckSurprisesActivity(reports) → []EarningsReport  // flag big misses/beats
-  → WriteDataEventsActivity(surprises)  // urgency: 'notable' for >10% surprise, 'alert' for >20%
+  → FetchRecentEarnings() → []EarningsReport
+  → CheckSurprises(reports) → []EarningsReport  // flag big misses/beats
+  → WriteEarningsReports(surprises)
+  → PublishNATS(surprises)  // publish to events.earnings_reports
 ```
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'earnings-calendar'`
-- `category`: `'earnings'`
-- `title`: `"AAPL Q1 2026 Earnings: Beat by $0.05"` or `"AAPL Earnings Due 2026-03-15 AMC"`
-- `body` JSONB: `{"symbol": "AAPL", "date": "2026-03-15", "hour": "amc", "eps_estimate": 1.50, "eps_actual": 1.55, "revenue_estimate": 95000000000, "revenue_actual": 96000000000, "surprise_pct": 3.33}`
-- `urgency`: `routine` for upcoming, `notable` for >10% surprise, `alert` for >20%
-- `source_id`: `"finnhub-earnings-AAPL-2026-Q1"`
+Table: `earnings_reports` (UUID primary key, dedicated table)
+- `ticker`, `report_date`, `hour`, `quarter`, `year`
+- `eps_estimate`, `eps_actual`, `revenue_estimate`, `revenue_actual`, `surprise_pct`
+- `source_id` (e.g. `"finnhub-earnings-AAPL-2026-Q1"`)
+- Dedup: `UNIQUE` constraint on `source_id` at this table level
+
+After each write, publishes to NATS JetStream subject `events.earnings_reports` with `{"id": "uuid", "table": "earnings_reports"}` payload.
 
 ---
 
@@ -257,5 +266,6 @@ After this phase:
 - [ ] `options-flow` service fetching chains from Tradier, computing GEX, writing to `options_flow` + `gamma_exposure`
 - [ ] `earnings-calendar` service tracking earnings dates + surprises
 - [ ] All three services running with Temporal cron workflows
-- [ ] Significant market moves auto-generate `data_events` with appropriate urgency
-- [ ] WebSocket pushes snapshot + options + earnings events to frontend
+- [ ] Significant market moves published to NATS JetStream (`events.market_snapshots`)
+- [ ] Snapshot prices published to NATS JetStream (`snapshots.{ticker}`) with inline data
+- [ ] Events published to NATS JetStream, consumed by api-gateway, pushed via WebSocket to frontend

@@ -15,15 +15,16 @@ Taxonomy engine that auto-tags data events with tickers, sectors, asset classes,
 ### What It Does
 The **single point for all AI processing**. No other service calls Claude — they just write raw events to the DB. The categorizer picks them up and does everything:
 
-1. Runs event through Claude Haiku (docker-claude-code) for analysis
-2. Extracts tickers, sectors, asset classes, regions
-3. Classifies urgency (routine/notable/alert)
-4. Determines sentiment (bullish/bearish/neutral)
-5. Summarizes content (news articles, Fed speeches, etc.)
-6. Scores Fed speeches hawkish/dovish
-7. Writes tags to `data_event_tags` table
-8. Updates event fields (summary, urgency) in `data_events` if needed
-9. Detects cross-service correlations
+1. Reads `data_events` entries, follows `ref_id` + `source_service` to fetch the full detail row from the dedicated source table (e.g., `news_articles`, `congress_trades`, `fed_speeches`)
+2. Runs event + detail content through Claude Haiku (docker-claude-code) for analysis
+3. Extracts tickers, sectors, asset classes, regions
+4. Classifies urgency (routine/notable/alert)
+5. Determines sentiment (bullish/bearish/neutral)
+6. Summarizes content (news articles, Fed speeches, etc.)
+7. Scores Fed speeches hawkish/dovish
+8. Writes tags to `data_event_tags` table
+9. Updates event fields (summary, urgency) in `data_events` if needed
+10. Detects cross-service correlations
 
 ### AI Categorization (docker-claude-code + Haiku)
 
@@ -32,6 +33,7 @@ Uses the api-gateway export endpoints to fetch data, writes it to temp files, mo
 **Flow**:
 ```
 1. Categorizer calls GET /api/export/events?untagged=true&limit=50
+   (export endpoint resolves each event's ref_id via source_service to include full detail data from the dedicated table)
 2. Writes response to /tmp/voidalpha/input/events.json
 3. Writes prompt to /tmp/voidalpha/input/prompt.md
 4. docker run --rm \
@@ -129,7 +131,7 @@ Maintain a local mapping table (loaded at startup, refreshed daily):
 
 ### Cross-Reference / Correlation Detection
 
-After tagging, check for temporal correlations:
+After tagging, check for temporal correlations. Correlations can query dedicated source tables directly (e.g., query `insider_trades` + `earnings_reports` to detect an insider buy before earnings) rather than relying solely on `data_events` metadata:
 
 1. **Insider + Earnings**: Insider buy within 30 days of earnings → generate correlation event
 2. **Congress + Committee**: Congress member trade in sector their committee oversees → flag
@@ -137,29 +139,29 @@ After tagging, check for temporal correlations:
 4. **Options + Earnings**: Unusual options activity within 7 days of earnings → flag
 5. **Macro + Market**: Major macro release (CPI, FOMC) within 24h → link to market moves
 
-Correlation events written to `data_events` with `source_service: 'categorizer'`, `category: 'correlation'`.
+Correlation events written to `data_events` with `source_service: 'categorizer'`, `category: 'correlation'`, `ref_id: NULL` (no backing detail table row).
 
 ### Temporal Workflows
 
 ```
 TagEventWorkflow (triggered by NOTIFY, not cron)
-  → FetchEventActivity(eventID) → DataEvent
-  → ExtractTickersActivity(event) → []string
-  → LookupSectorsActivity(tickers) → map[string]SectorInfo
-  → WriteTagsActivity(eventID, tags)
+  → FetchEvent(eventID) → DataEvent
+  → ExtractTickers(event) → []string
+  → LookupSectors(tickers) → map[string]SectorInfo
+  → WriteTags(eventID, tags)
 
 SweepUntaggedWorkflow (cron: every 5 min)
-  → QueryUntaggedEventsActivity(limit: 100) → []DataEvent
+  → QueryUntaggedEvents(limit: 100) → []DataEvent
   → For each: ExtractTickersActivity + LookupSectorsActivity + WriteTagsActivity
 
 CorrelationWorkflow (cron: every 15 min)
-  → QueryRecentEventsActivity(window: 24h) → []DataEvent with tags
-  → DetectCorrelationsActivity(events) → []Correlation
-  → WriteDataEventsActivity(correlations)
+  → QueryRecentEvents(window: 24h) → []DataEvent with tags
+  → DetectCorrelations(events) → []Correlation
+  → WriteDataEvents(correlations)
 
 RefreshTaxonomyWorkflow (cron: every 24 hours)
-  → FetchTickerUniverseActivity() → []TickerInfo  // from Finnhub/Polygon
-  → UpdateLocalMappingsActivity(tickers)
+  → FetchTickerUniverse() → []TickerInfo  // from Finnhub/Polygon
+  → UpdateLocalMappings(tickers)
 ```
 
 ### Shared `tagger` Package
@@ -199,19 +201,21 @@ type Config struct {
 ### Data Written
 
 Table: `data_event_tags`
-- `event_id`, `tag_type`, `tag_value`
+- `event_id` (UUID references `data_events.id`), `tag_type`, `tag_value`
 - Examples for a single event:
-  - `(123, "ticker", "AAPL")`
-  - `(123, "sector", "technology")`
-  - `(123, "asset_class", "equity")`
-  - `(123, "region", "US")`
+  - `("a1b2c3d4-...", "ticker", "AAPL")`
+  - `("a1b2c3d4-...", "sector", "technology")`
+  - `("a1b2c3d4-...", "asset_class", "equity")`
+  - `("a1b2c3d4-...", "region", "US")`
 
 Table: `data_events` (correlation events)
 - `source_service`: `'categorizer'`
 - `category`: varies
+- `ref_id`: `NULL` (correlations have no backing detail table row)
+- Uses `title` + `summary` fields to describe the correlation (no `body` JSONB)
 - Examples:
-  - `title: "Correlation: NVDA insider buy + earnings in 5 days"`, `body: {"type": "insider_earnings", "ticker": "NVDA", "insider_event_id": 456, "earnings_date": "2026-03-17", "days_until_earnings": 5}`
-  - `title: "Correlation: Congress cluster buy in defense + FOMC meeting tomorrow"`, `body: {"type": "congress_macro", "sector": "defense", "congress_event_ids": [789, 790], "macro_event": "FOMC"}`
+  - `title: "Correlation: NVDA insider buy + earnings in 5 days"`, `summary: "Insider Tim Cook purchased shares 5 days before Q1 earnings report"`
+  - `title: "Correlation: Congress cluster buy in defense + FOMC meeting tomorrow"`, `summary: "Multiple congress members bought defense sector stocks within 24h of scheduled FOMC meeting"`
 
 ---
 

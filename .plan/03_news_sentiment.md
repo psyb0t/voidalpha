@@ -1,12 +1,13 @@
 # 03 — News & Sentiment
 
-Financial news aggregation, fear & greed tracking, social sentiment, VIX signals.
+Financial news aggregation, YouTube analyst transcripts, fear & greed tracking, social sentiment, VIX signals.
 
 ## Services in This Phase
 
 | Service | Task Queue | Schedule |
 |---------|-----------|----------|
 | `news-aggregator` | `news-aggregator-queue` | Every 5 min |
+| `youtube-intel` | `youtube-intel-queue` | Every 30 min |
 | `sentiment-tracker` | `sentiment-tracker-queue` | Every 15–60 min (varies by source) |
 
 ---
@@ -14,14 +15,14 @@ Financial news aggregation, fear & greed tracking, social sentiment, VIX signals
 ## 3.1 — news-aggregator Service
 
 ### What It Does
-Aggregates financial news from multiple sources, deduplicates, and writes to `data_events` with `category: 'news'`.
+Aggregates financial news from multiple sources, deduplicates, writes to `news_articles` table, and publishes notifications to NATS JetStream.
 
 ### Data Sources
 
 #### RSS Feeds (no API key needed)
 Direct HTTP fetch, parse XML. No browser needed.
 
-Not just financial news — geopolitical, tech, energy, health, regulatory, trade wars, natural disasters, etc. all move markets. The categorizer (Claude Haiku) figures out what's market-relevant and tags it.
+Not just financial news — geopolitical, tech, energy, health, regulatory, trade wars, natural disasters, etc. all move markets.
 
 **Financial**:
 
@@ -61,7 +62,7 @@ Not just financial news — geopolitical, tech, energy, health, regulatory, trad
 - **Base URL**: `https://newsapi.org/v2`
 - **Auth**: `X-Api-Key` header or `apiKey` query param
 - **Key Endpoints**:
-  - `GET /everything?language=en&sortBy=publishedAt` — broad search (categorizer decides relevance)
+  - `GET /everything?language=en&sortBy=publishedAt` — broad search
   - `GET /top-headlines?country=us` — top US headlines across all categories
   - `GET /top-headlines?category=business&country=us` — business headlines
 - **Free Tier**: 100 requests/day, articles delayed by 24h on free plan. Developer plan: 1000 requests/day.
@@ -75,21 +76,18 @@ Each article gets a `source_id` for dedup:
 - Finnhub: `finnhub-news-{id}`
 - NewsAPI: `newsapi-{url hash}`
 
-Before writing, check `UNIQUE(source_service, source_id)` constraint. ON CONFLICT DO NOTHING.
-
-### No Inline AI Processing
-
-This service just fetches and writes raw events. No summarization or classification here. The `categorizer` service handles all AI processing (summarization, urgency, tagging) after events land in the DB.
+Dedup uses `source_id UNIQUE` constraint on `news_articles`. ON CONFLICT (source_id) DO NOTHING on `news_articles`. Only publish to NATS if the `news_articles` insert succeeded (returned an id).
 
 ### Temporal Workflows
 
 ```
 NewsFetchWorkflow (cron: every 5 min)
-  → FetchRSSActivity(feeds []FeedConfig) → []Article
-  → FetchFinnhubNewsActivity(category) → []Article
-  → FetchNewsAPIActivity(query) → []Article  // only if within daily limit
-  → MergeAndDeduplicateActivity(allArticles) → []Article
-  → WriteDataEventsActivity(articles)
+  → FetchRSS(feeds []FeedConfig) → []Article
+  → FetchFinnhubNews(category) → []Article
+  → FetchNewsAPI(query) → []Article  // only if within daily limit
+  → MergeAndDeduplicate(allArticles) → []Article
+  → WriteArticles(articles)
+  → PublishNATS(articles)  // publish to events.news_articles
 ```
 
 **Retry Policy**: 3 attempts, 10s initial, backoff 2.0, max 60s. RSS feeds that fail are logged but don't block others.
@@ -107,18 +105,109 @@ type Config struct {
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'news-aggregator'`
-- `category`: `'news'`
-- `title`: Article headline
-- `body` JSONB: `{"summary": "...", "source_name": "Reuters", "image_url": "...", "related_tickers": ["AAPL"]}`
-- `source_url`: Article URL
+**Table: `news_articles`** (UUID primary key)
+- `headline`: Article headline
+- `source_name`: e.g. `"Reuters"`, `"Finnhub"`, `"NewsAPI"`
+- `summary`: Article summary text
+- `url`: Article URL
+- `image_url`: Article image URL (nullable)
+- `body_text`: Full article body text (nullable)
 - `published_at`: Article publish timestamp
-- `source_id`: Dedup key (see above)
+- `source_id`: Dedup key (UNIQUE, see above)
+
+After each write, publishes to NATS JetStream subject `events.news_articles` with `{"id": "uuid", "table": "news_articles"}` payload.
 
 ---
 
-## 3.2 — sentiment-tracker Service
+## 3.2 — youtube-intel Service
+
+### What It Does
+Downloads transcripts from a configurable list of YouTube channels using yt-dlp. Stores raw transcripts in `youtube_transcripts` for reference and analysis.
+
+### Target Channels (configurable via env/config)
+
+Macro analysts, news analysts, quants, traders — anything that might contain market-moving analysis:
+
+| Channel | Focus |
+|---------|-------|
+| Meet Kevin | Macro, Fed, real estate, market commentary |
+| Arete Trading | Technical analysis, options flow |
+| Bravos Research | Macro, geopolitical, institutional flow |
+| Eurodollar University (Jeff Snider) | Macro, bonds, liquidity |
+| The Maverick of Wall Street | Daily market recap, technicals |
+| Game of Trades | Macro, charts, recession signals |
+| Heresy Financial | Macro, contrarian takes |
+| Wealthion | Macro interviews, fund managers |
+| Patrick Boyle | Quant finance, market structure |
+| Add more via config... | |
+
+Channel list is fully configurable — add/remove via `YOUTUBE_CHANNELS` env var (comma-separated channel IDs/URLs).
+
+### How It Works
+
+1. yt-dlp checks each channel's RSS feed or uploads page for new videos
+2. For each new video not already in the DB (dedup by video ID):
+   - Download auto-generated or manual subtitles/transcript (no video download)
+   - `yt-dlp --write-auto-sub --sub-lang en --skip-download --write-sub`
+   - Extract transcript text (VTT/SRT → plain text)
+3. Write transcript to `youtube_transcripts` table
+4. Publish notification to NATS JetStream subject `events.youtube_transcripts`
+
+### Deduplication
+
+`video_id` UNIQUE on `youtube_transcripts` (e.g., `dQw4w9WgXcQ`). Only publish to NATS if the `youtube_transcripts` insert succeeded (returned an id).
+
+### Temporal Workflows
+
+Parent workflow launches child workflows in parallel — one per channel. Each child handles its own videos independently.
+
+```
+YouTubeScanWorkflow (cron: every 30 min)
+  → ListChannels() → []ChannelConfig
+  → For each channel: launch ChannelFetchWorkflow as child workflow (parallel)
+
+ChannelFetchWorkflow (child, one per channel)
+  → FetchNewVideos(channelID) → []VideoMeta
+  → For each new video (not in DB):
+    → DownloadTranscript(videoID) → string
+    → WriteTranscript(transcript)
+    → PublishNATS(transcript)  // publish to events.youtube_transcripts
+```
+
+**Retry Policy**: 3 attempts, 15s initial, backoff 2.0, max 120s. Transcript download can be slow.
+
+### Config
+
+```go
+type Config struct {
+    Channels      string `env:"YOUTUBE_CHANNELS" default:""`  // comma-separated channel IDs or URLs
+    FetchInterval string `env:"YOUTUBE_FETCH_INTERVAL" default:"30m"`
+    SubLang       string `env:"YOUTUBE_SUB_LANG" default:"en"`
+}
+```
+
+### Data Written
+
+**Table: `youtube_transcripts`** (UUID primary key)
+- `channel`: Channel name (e.g., `"Meet Kevin"`)
+- `channel_id`: YouTube channel ID (e.g., `"UCUvvj5lwue7PwE-yL7r671A"`)
+- `video_id`: YouTube video ID (UNIQUE, e.g., `"abc123"`)
+- `title`: Video title (e.g., `"THE FED JUST BROKE EVERYTHING | Meet Kevin"`)
+- `transcript`: Full transcript text
+- `duration_secs`: Video duration in seconds (e.g., `1847`)
+- `published_at`: Video publish timestamp
+
+After each write, publishes to NATS JetStream subject `events.youtube_transcripts` with `{"id": "uuid", "table": "youtube_transcripts"}` payload.
+
+### Notes
+- yt-dlp needs to be installed in the Docker image (`pip install yt-dlp` or binary)
+- No YouTube API key needed — yt-dlp works without auth for public videos/transcripts
+- Only downloads subtitles, never the actual video — minimal bandwidth/storage
+- Some videos won't have auto-generated subs (rare for English content) — skip those
+
+---
+
+## 3.3 — sentiment-tracker Service
 
 ### What It Does
 Tracks market sentiment indicators: Fear & Greed Index, put/call ratio, VIX analysis, AAII sentiment, and Reddit sentiment.
@@ -157,7 +246,7 @@ Tracks market sentiment indicators: Fear & Greed Index, put/call ratio, VIX anal
   - VIX 15–25: Normal
   - VIX 25–35: Elevated fear
   - VIX > 35: Extreme fear / panic
-- Writes a `data_event` with `category: 'sentiment'` when VIX crosses thresholds
+- Publishes to NATS JetStream subject `events.sentiment_readings` when VIX crosses thresholds
 
 #### AAII Sentiment Survey
 - **URL**: `https://www.aaii.com/sentimentsurvey/sent_results`
@@ -184,26 +273,31 @@ Tracks market sentiment indicators: Fear & Greed Index, put/call ratio, VIX anal
 
 ```
 FearGreedWorkflow (cron: every 30 min)
-  → FetchFearGreedActivity() → FearGreedData
-  → WriteDataEventActivity(data)  // category: 'sentiment'
+  → FetchFearGreed() → FearGreedData
+  → WriteSentimentReading(data)
+  → PublishNATS(data)  // publish to events.sentiment_readings
 
 PutCallRatioWorkflow (cron: every 30 min, market hours)
-  → ScrapeCBOEActivity() → PutCallData  // uses stealthy-auto-browse
-  → WriteDataEventActivity(data)
+  → ScrapeCBOE() → PutCallData  // uses stealthy-auto-browse
+  → WriteSentimentReading(data)
+  → PublishNATS(data)  // publish to events.sentiment_readings
 
 VIXAnalysisWorkflow (cron: every 15 min)
-  → ReadLatestVIXActivity() → VIXSnapshot  // reads from market_snapshots
-  → ClassifyVIXActivity(snapshot) → VIXClassification
-  → WriteDataEventActivity(classification)  // only if threshold crossed
+  → ReadLatestVIX() → VIXSnapshot  // reads from market_snapshots
+  → ClassifyVIX(snapshot) → VIXClassification
+  → WriteSentimentReading(classification)  // only if threshold crossed
+  → PublishNATS(classification)  // publish to events.sentiment_readings
 
 AAIISentimentWorkflow (cron: every 6 hours)
-  → ScrapeAAIIActivity() → AAIIData  // uses stealthy-auto-browse
-  → WriteDataEventActivity(data)
+  → ScrapeAAII() → AAIIData  // uses stealthy-auto-browse
+  → WriteSentimentReading(data)
+  → PublishNATS(data)  // publish to events.sentiment_readings
 
 RedditSentimentWorkflow (cron: every 30 min)
-  → FetchRedditPostsActivity(subreddits) → []Post
-  → AnalyzeSentimentActivity(posts) → SentimentReport
-  → WriteDataEventActivity(report)
+  → FetchRedditPosts(subreddits) → []Post
+  → AnalyzeSentiment(posts) → SentimentReport
+  → WriteSentimentReading(report)
+  → PublishNATS(report)  // publish to events.sentiment_readings
 ```
 
 ### Browser Scraping Pattern
@@ -234,24 +328,24 @@ type Config struct {
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'sentiment-tracker'`
-- `category`: `'sentiment'`
-- Examples:
-  - `title: "Fear & Greed Index: 25 (Extreme Fear)"`, `body: {"score": 25, "label": "extreme_fear", "components": {...}, "previous": 32}`
-  - `title: "Put/Call Ratio: 1.35 (Elevated)"`, `body: {"total_pcr": 1.35, "equity_pcr": 1.20, "index_pcr": 1.50}`
-  - `title: "VIX Alert: Crossed above 30"`, `body: {"vix": 31.5, "classification": "elevated_fear", "threshold_crossed": 30}`
-  - `title: "AAII Sentiment: 45% Bearish"`, `body: {"bullish": 25.5, "bearish": 45.0, "neutral": 29.5}`
-  - `title: "Reddit: GME trending on r/wallstreetbets"`, `body: {"subreddit": "wallstreetbets", "top_tickers": [{"ticker": "GME", "mentions": 342}], "overall_sentiment": "bullish"}`
+**Table: `sentiment_readings`** (UUID primary key)
+- `indicator`: Indicator name (e.g., `"fear_greed"`, `"put_call_ratio"`, `"vix"`, `"aaii"`, `"reddit"`)
+- `value`: Numeric value (e.g., `25`, `1.35`, `31.5`)
+- `label`: Human-readable label (e.g., `"extreme_fear"`, `"elevated"`, `"elevated_fear"`)
+- `components` JSONB: Breakdown data (e.g., `{"previous": 32, ...}` for Fear & Greed, `{"total_pcr": 1.35, "equity_pcr": 1.20, "index_pcr": 1.50}` for put/call)
+- `captured_at`: Timestamp when the reading was captured
+
+After each write, publishes to NATS JetStream subject `events.sentiment_readings` with `{"id": "uuid", "table": "sentiment_readings"}` payload.
 
 ---
 
-## 3.3 — Deliverables
+## 3.4 — Deliverables
 
 After this phase:
 - [ ] `news-aggregator` pulling from 8+ RSS feeds, Finnhub News, and NewsAPI
 - [ ] News deduplication working via `source_id`
-- [ ] Basic keyword urgency classification
+- [ ] `youtube-intel` downloading transcripts from configurable channel list via yt-dlp
+- [ ] YouTube transcripts stored in `youtube_transcripts` table
 - [ ] `sentiment-tracker` fetching Fear & Greed, put/call ratio, VIX, AAII, Reddit sentiment
 - [ ] Browser scraping working for JS-heavy sources (CBOE, AAII)
-- [ ] Sentiment events flowing to frontend via WebSocket
+- [ ] Sentiment events published to NATS JetStream, consumed by api-gateway, pushed via WebSocket to frontend

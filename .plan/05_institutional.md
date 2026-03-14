@@ -46,7 +46,9 @@ Tracks stock trades by US Congress members (STOCK Act disclosures). Detects larg
 
 ### Deduplication
 
-`source_id` format: `congress-{member_slug}-{ticker}-{trade_date}-{amount_range}`
+Dedup via `source_id UNIQUE` constraint on the `congress_trades` table.
+
+Format: `congress-{member_slug}-{ticker}-{trade_date}-{amount_range}`
 
 Example: `congress-nancy-pelosi-NVDA-2026-03-01-1M-5M`
 
@@ -54,16 +56,18 @@ Example: `congress-nancy-pelosi-NVDA-2026-03-01-1M-5M`
 
 ```
 CongressTradesWorkflow (cron: every 2 hours)
-  → ScrapeCapitolTradesActivity(lastScrapeTime) → []CongTrade
-  → DeduplicateActivity(trades) → []CongTrade
-  → EnrichActivity(trades) → []CongTrade  // add committee info, sector context
-  → ClassifyUrgencyActivity(trades) → []CongTrade
-  → WriteDataEventsActivity(trades)
+  → ScrapeCapitolTrades(lastScrapeTime) → []CongTrade
+  → Deduplicate(trades) → []CongTrade
+  → Enrich(trades) → []CongTrade  // add committee info, sector context
+  → ClassifyUrgency(trades) → []CongTrade
+  → WriteCongressTrades(trades)
+  → PublishNATS(trades)  // publish to events.congress_trades
 
 QuiverBackfillWorkflow (cron: every 4 hours)
-  → ScrapeQuiverActivity() → []CongTrade
-  → CrossReferenceActivity(trades) → []CongTrade  // only keep ones not in Capitol Trades
-  → WriteDataEventsActivity(trades)
+  → ScrapeQuiver() → []CongTrade
+  → CrossReference(trades) → []CongTrade  // only keep ones not in Capitol Trades
+  → WriteCongressTrades(trades)
+  → PublishNATS(trades)  // publish to events.congress_trades
 ```
 
 ### Urgency Classification
@@ -83,12 +87,10 @@ type Config struct {
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'congress-trades'`
-- `category`: `'political'`
-- Examples:
-  - `title: "Rep. Nancy Pelosi bought $1M-$5M of NVDA"`, `body: {"member": "Nancy Pelosi", "party": "D", "chamber": "House", "ticker": "NVDA", "trade_type": "purchase", "amount_range": "$1,000,001 - $5,000,000", "trade_date": "2026-02-28", "filed_date": "2026-03-10", "committees": ["Financial Services"], "source": "capitoltrades"}`
-  - `title: "Congress Cluster Alert: 5 members bought defense stocks"`, `body: {"tickers": ["LMT", "RTX", "NOC"], "members": [...], "window": "48h", "total_amount": "$5M+"}`
+**Primary table: `congress_trades`** (UUID primary key)
+- `member`, `party`, `chamber`, `ticker`, `trade_type`, `amount_range`, `trade_date`, `filed_date`, `committees` (JSONB), `source`, `source_id` (UNIQUE)
+
+After each write, publishes to NATS JetStream subject `events.congress_trades` with `{"id": "uuid", "table": "congress_trades"}` payload.
 
 ---
 
@@ -128,16 +130,18 @@ Tracks corporate insider (CEO, CFO, directors, 10%+ owners) stock transactions f
 
 ```
 InsiderFilingsWorkflow (cron: every 1 hour)
-  → FetchFinnhubInsiderActivity(tickers) → []InsiderTrade
-  → FetchEDGARFilingsActivity(dateRange) → []InsiderTrade
-  → MergeAndDeduplicateActivity(trades) → []InsiderTrade
-  → ClassifyActivity(trades) → []InsiderTrade
-  → WriteDataEventsActivity(trades)
+  → FetchFinnhubInsider(tickers) → []InsiderTrade
+  → FetchEDGARFilings(dateRange) → []InsiderTrade
+  → MergeAndDeduplicate(trades) → []InsiderTrade
+  → Classify(trades) → []InsiderTrade
+  → WriteInsiderTrades(trades)
+  → PublishNATS(trades)  // publish to events.insider_trades
 
 InsiderClusterWorkflow (cron: every 4 hours)
-  → QueryRecentTradesActivity(window: 7d) → []InsiderTrade
-  → DetectClustersActivity(trades) → []ClusterSignal
-  → WriteDataEventsActivity(clusters)
+  → QueryRecentTrades(window: 7d) → []InsiderTrade
+  → DetectClusters(trades) → []ClusterSignal
+  → WriteInsiderTrades(clusters)
+  → PublishNATS(clusters)  // publish to events.insider_trades
 ```
 
 ### Cluster Detection
@@ -165,12 +169,10 @@ type Config struct {
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'insider-trading'`
-- `category`: `'insider'`
-- Examples:
-  - `title: "AAPL CEO Tim Cook sold 50,000 shares at $185"`, `body: {"insider": "Tim Cook", "role": "CEO", "ticker": "AAPL", "transaction": "sale", "shares": 50000, "price": 185.0, "total_value": 9250000, "is_10b5_1": true, "filing_date": "2026-03-10"}`
-  - `title: "Insider Cluster Buy: 4 PLTR insiders purchased this week"`, `body: {"ticker": "PLTR", "insiders": [{"name": "...", "shares": 10000}, ...], "window_days": 7, "total_shares": 85000, "avg_price": 22.50}`
+**Primary table: `insider_trades`** (UUID primary key)
+- `insider_name`, `role`, `ticker`, `transaction_type`, `shares`, `price`, `total_value`, `is_10b5_1`, `filing_date`, `transaction_date`, `source_id` (UNIQUE)
+
+After each write, publishes to NATS JetStream subject `events.insider_trades` with `{"id": "uuid", "table": "insider_trades"}` payload.
 
 ---
 
@@ -217,26 +219,30 @@ Tracks short interest data, dark pool (ATS) volume, and failure-to-deliver (FTD)
 
 ```
 ShortInterestWorkflow (cron: every 12 hours)
-  → FetchFINRATokenActivity() → OAuth token
-  → FetchShortInterestActivity(token) → []ShortInterestData  // FINRA Query API
-  → DetectChangesActivity(current, previous) → []Change
-  → WriteDataEventsActivity(changes)
+  → FetchFINRAToken() → OAuth token
+  → FetchShortInterest(token) → []ShortInterestData  // FINRA Query API
+  → DetectChanges(current, previous) → []Change
+  → WriteShortInterest(changes)
+  → PublishNATS(changes)  // publish to events.short_interest
 
 DarkPoolWorkflow (cron: every 12 hours)
-  → FetchFINRATokenActivity() → OAuth token
-  → FetchATSDataActivity(token) → []DarkPoolData  // FINRA Query API
-  → CalculateRatiosActivity(data) → []DarkPoolAnalysis
-  → WriteDataEventsActivity(analysis)
+  → FetchFINRAToken() → OAuth token
+  → FetchATSData(token) → []DarkPoolData  // FINRA Query API
+  → CalculateRatios(data) → []DarkPoolAnalysis
+  → WriteDarkPoolVolume(analysis)
+  → PublishNATS(analysis)  // publish to events.dark_pool_volume
 
 ShortVolumeWorkflow (cron: daily at 6 PM ET)
-  → DownloadShortVolumeActivity(date) → []ShortVolumeData
-  → CalculateRatiosActivity(data) → []ShortVolumeAnalysis
-  → WriteDataEventsActivity(analysis)
+  → DownloadShortVolume(date) → []ShortVolumeData
+  → CalculateRatios(data) → []ShortVolumeAnalysis
+  → WriteShortInterest(analysis)
+  → PublishNATS(analysis)  // publish to events.short_interest
 
 FTDWorkflow (cron: daily)
-  → DownloadFTDActivity() → []FTDData
-  → FilterSignificantActivity(data, threshold) → []FTDData
-  → WriteDataEventsActivity(data)
+  → DownloadFTD() → []FTDData
+  → FilterSignificant(data, threshold) → []FTDData
+  → WriteFTDData(data)
+  → PublishNATS(data)  // publish to events.ftd_data
 ```
 
 ### Urgency Classification
@@ -258,14 +264,18 @@ type Config struct {
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'finra-data'`
-- `category`: varies (see below)
+Writes to THREE dedicated tables (all UUID primary keys), then publishes to NATS JetStream.
 
-Examples:
-- `category: 'options'`, `title: "GME Short Interest: 45% of float"`, `body: {"ticker": "GME", "short_interest": 45000000, "float": 100000000, "short_pct_float": 45.0, "days_to_cover": 3.2, "settlement_date": "2026-03-01", "change_pct": 12.0}`
-- `category: 'options'`, `title: "SPY Dark Pool Volume: 55% of total"`, `body: {"ticker": "SPY", "dark_pool_volume": 150000000, "total_volume": 273000000, "dark_pct": 55.0, "top_ats": [{"name": "Citadel", "volume": 45000000}]}`
-- `category: 'options'`, `title: "TSLA FTD Spike: 2.5M shares"`, `body: {"ticker": "TSLA", "ftd_quantity": 2500000, "price": 250.0, "notional_value": 625000000, "settlement_date": "2026-03-05"}`
+**Table: `short_interest`**
+- `ticker`, `shares_short`, `float_pct`, `days_to_cover`, `change_pct`, `settlement_date`
+
+**Table: `dark_pool_volume`**
+- `ticker`, `ats_volume`, `total_volume`, `dark_pct`, `top_ats` (JSONB), `week_ending`
+
+**Table: `ftd_data`**
+- `ticker`, `quantity`, `price`, `notional_value`, `settlement_date`
+
+After each write, publishes to the corresponding NATS JetStream subject (`events.short_interest`, `events.dark_pool_volume`, or `events.ftd_data`) with `{"id": "uuid", "table": "<table_name>"}` payload.
 
 ---
 

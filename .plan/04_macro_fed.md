@@ -15,7 +15,7 @@ Economic indicators, GDP, CPI, unemployment, Fed speeches, FOMC minutes, rate de
 ## 4.1 — macro-data Service
 
 ### What It Does
-Fetches US economic indicators from FRED, BLS, and BEA. Tracks releases, detects significant changes, writes to `data_events` with `category: 'macro'`.
+Fetches US economic indicators from FRED, BLS, and BEA. Tracks releases, detects significant changes, writes to `macro_indicators` table and publishes notifications to NATS JetStream.
 
 ### Data Sources
 
@@ -101,19 +101,22 @@ Fetches US economic indicators from FRED, BLS, and BEA. Tracks releases, detects
 
 ```
 DailyIndicatorsWorkflow (cron: every 1 hour)
-  → FetchFREDSeriesActivity(dailySeries) → map[string]Observation
-  → DetectChangesActivity(observations, previousValues) → []Change
-  → WriteDataEventsActivity(changes)
+  → FetchFREDSeries(dailySeries) → map[string]Observation
+  → DetectChanges(observations, previousValues) → []Change
+  → WriteMacroIndicators(changes)
+  → PublishNATS(changes)  // publish to events.macro_indicators
 
 MonthlyReleasesWorkflow (cron: every 6 hours)
-  → FetchFREDReleaseDatesActivity(range) → []Release
-  → FetchBLSDataActivity(series, year) → []Observation
-  → CompareToExpectationsActivity(actuals, estimates) → []Surprise
-  → WriteDataEventsActivity(surprises)
+  → FetchFREDReleaseDates(range) → []Release
+  → FetchBLSData(series, year) → []Observation
+  → CompareToExpectations(actuals, estimates) → []Surprise
+  → WriteMacroIndicators(surprises)
+  → PublishNATS(surprises)  // publish to events.macro_indicators
 
 TreasuryWorkflow (cron: every 12 hours)
-  → FetchTreasuryRatesActivity() → TreasuryData
-  → WriteDataEventsActivity(data)
+  → FetchTreasuryRates() → TreasuryData
+  → WriteMacroIndicators(data)
+  → PublishNATS(data)  // publish to events.macro_indicators
 ```
 
 ### Change Detection
@@ -139,13 +142,17 @@ type Config struct {
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'macro-data'`
-- `category`: `'macro'`
-- Examples:
-  - `title: "CPI (CPIAUCSL) January 2026: 3.1% YoY"`, `body: {"series_id": "CPIAUCSL", "value": 315.2, "previous": 314.1, "change_pct": 0.35, "yoy_pct": 3.1, "source": "fred"}`
-  - `title: "Yield Curve Alert: 10Y-2Y Spread at -0.15%"`, `body: {"series_id": "T10Y2Y", "value": -0.15, "inverted": true}`
-  - `title: "Nonfarm Payrolls: +180K (Est: +200K)"`, `body: {"series_id": "PAYEMS", "value": 180000, "estimate": 200000, "surprise": -20000}`
+**Primary table: `macro_indicators`** (UUID primary key)
+- `id` UUID PK
+- `series_id` TEXT — e.g. `'CPIAUCSL'`, `'T10Y2Y'`, `'PAYEMS'`
+- `value` DOUBLE PRECISION
+- `previous_value` DOUBLE PRECISION
+- `change_pct` DOUBLE PRECISION
+- `yoy_pct` DOUBLE PRECISION
+- `source` TEXT — e.g. `'fred'`, `'bls'`, `'treasury'`
+- `observed_at` TIMESTAMPTZ
+
+After each write, publishes to NATS JetStream subject `events.macro_indicators` with `{"id": "uuid", "table": "macro_indicators"}` payload.
 
 ---
 
@@ -173,8 +180,7 @@ Monitors Federal Reserve communications: speeches, FOMC minutes, rate decisions,
 - When RSS detects a new speech:
   1. Fetch the speech page URL (most are plain HTML, use direct HTTP + goquery)
   2. Use stealthy-auto-browse only if direct fetch fails
-  3. Store the full text in `data_events` body JSONB
-  4. Categorizer service handles hawkish/dovish scoring, summarization, and key phrase extraction via Claude Haiku
+  3. Store the full text in the `fed_speeches` table
 
 #### CME FedWatch (rate expectations)
 - **URL**: `https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html`
@@ -182,39 +188,27 @@ Monitors Federal Reserve communications: speeches, FOMC minutes, rate decisions,
 - **Data**: Probability of rate hike/cut at each upcoming meeting
 - **Schedule**: Every 2 hours
 
-### Hawkish/Dovish Scoring
-
-Hawkish/dovish scoring is handled by the `categorizer` service via Claude Haiku. The `fed-watcher` just stores the raw speech text — categorizer picks it up and runs analysis:
-
-```
-Prompt template (used by categorizer):
-Analyze this Federal Reserve speech. Return JSON with:
-- hawkish_score: float -1.0 (ultra-dovish) to +1.0 (ultra-hawkish)
-- summary: 2-3 sentence summary of key points
-- key_phrases: list of significant phrases
-- policy_signals: any hints about future rate decisions
-- market_impact: expected market reaction (bullish/bearish/neutral for equities, bonds, dollar)
-```
-
 ### Temporal Workflows
 
 ```
 FedRSSWorkflow (cron: every 15 min)
-  → FetchFedRSSActivity(feeds) → []FedItem
-  → DeduplicateActivity(items) → []FedItem
+  → FetchFedRSS(feeds) → []FedItem
+  → Deduplicate(items) → []FedItem
   → For each new item:
-    → FetchFullTextActivity(url) → string
-    → ScoreHawkishDovishActivity(text) → float64
-  → WriteDataEventsActivity(items)
+    → FetchFullText(url) → string
+  → WriteFedSpeeches(items)
+  → PublishNATS(items)  // publish to events.fed_speeches
 
 FOMCCalendarWorkflow (cron: every 24 hours)
-  → ScrapeFOMCCalendarActivity() → []FOMCMeeting
-  → WriteDataEventsActivity(meetings)  // upcoming meetings as routine events
+  → ScrapeFOMCCalendar() → []FOMCMeeting
+  → WriteFOMCMeetings(meetings)
+  → PublishNATS(meetings)  // publish to events.fomc_meetings
 
 FedWatchWorkflow (cron: every 2 hours)
-  → ScrapeFedWatchActivity() → RateExpectations
-  → DetectShiftActivity(current, previous) → bool
-  → WriteDataEventActivity(expectations)  // notable if >5% shift in probabilities
+  → ScrapeFedWatch() → RateExpectations
+  → DetectShift(current, previous) → bool
+  → WriteRateExpectations(expectations)
+  → PublishNATS(expectations)  // publish to events.rate_expectations, notable if >5% shift
 ```
 
 ### Config
@@ -229,20 +223,41 @@ type Config struct {
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'fed-watcher'`
-- `category`: `'macro'` (for rate decisions and data) or `'political'` (for Fed speeches with policy implications)
-- Examples:
-  - `title: "Fed Chair Powell Speech: 'Inflation remains elevated'"`, `body: {"speaker": "Jerome Powell", "type": "speech", "hawkish_score": 0.6, "key_phrases": ["inflation", "restrictive", "data-dependent"], "url": "..."}`
-  - `title: "FOMC Meeting: March 18-19, 2026"`, `body: {"type": "fomc_meeting", "dates": ["2026-03-18", "2026-03-19"], "minutes_release": "2026-04-09", "press_conference": true}`
-  - `title: "FedWatch: 72% probability of rate hold in March"`, `body: {"meeting_date": "2026-03-19", "hold": 72.0, "cut_25bp": 20.0, "cut_50bp": 5.0, "hike_25bp": 3.0, "shift_from_previous": -4.5}`
+**Writes to THREE dedicated tables** (all UUID primary keys), depending on event type:
+
+**1. `fed_speeches`** — for Fed speeches
+- `id` UUID PK
+- `speaker` TEXT — e.g. `'Jerome Powell'`
+- `speech_type` TEXT — e.g. `'speech'`, `'testimony'`, `'press_conference'`
+- `title` TEXT
+- `url` TEXT
+- `full_text` TEXT
+- `published_at` TIMESTAMPTZ
+
+**2. `fomc_meetings`** — for FOMC calendar entries
+- `id` UUID PK
+- `meeting_start` DATE
+- `meeting_end` DATE
+- `minutes_release` DATE
+- `press_conference` BOOLEAN
+
+**3. `rate_expectations`** — for CME FedWatch rate probabilities
+- `id` UUID PK
+- `meeting_date` DATE
+- `hold_pct` DOUBLE PRECISION
+- `cut_25_pct` DOUBLE PRECISION
+- `cut_50_pct` DOUBLE PRECISION
+- `hike_25_pct` DOUBLE PRECISION
+- `shift_from_prev` DOUBLE PRECISION
+
+After each write, publishes to the corresponding NATS JetStream subject (`events.fed_speeches`, `events.fomc_meetings`, or `events.rate_expectations`) with `{"id": "uuid", "table": "<table_name>"}` payload.
 
 ---
 
 ## 4.3 — econ-calendar Service
 
 ### What It Does
-Fetches upcoming economic data releases (CPI, NFP, GDP, FOMC, etc.) with dates, times, previous values, forecasts, and importance. Writes to `data_events` with `category: 'macro'`. Swing traders check this to know what's coming and when.
+Fetches upcoming economic data releases (CPI, NFP, GDP, FOMC, etc.) with dates, times, previous values, forecasts, and importance. Writes to `econ_calendar` table and publishes notifications to NATS JetStream. Swing traders check this to know what's coming and when.
 
 ### Data Sources
 
@@ -269,10 +284,11 @@ Fetches upcoming economic data releases (CPI, NFP, GDP, FOMC, etc.) with dates, 
 
 ```
 EconCalendarWorkflow (cron: every 6 hours)
-  → FetchFinnhubCalendarActivity(from, to) → []EconEvent
-  → FetchFREDReleasesActivity(from, to) → []EconEvent
-  → MergeAndDeduplicateActivity(events) → []EconEvent
-  → WriteDataEventsActivity(events)
+  → FetchFinnhubCalendar(from, to) → []EconEvent
+  → FetchFREDReleases(from, to) → []EconEvent
+  → MergeAndDeduplicate(events) → []EconEvent
+  → WriteEconCalendar(events)
+  → PublishNATS(events)  // publish to events.econ_calendar
 ```
 
 ### Config
@@ -288,14 +304,17 @@ type Config struct {
 
 ### Data Written
 
-Table: `data_events`
-- `source_service`: `'econ-calendar'`
-- `category`: `'macro'`
-- `urgency`: `alert` for high-impact (FOMC, CPI, NFP), `notable` for medium, `routine` for low
-- Examples:
-  - `title: "Upcoming: CPI (YoY) — Mar 17 08:30 ET"`, `body: {"event": "CPI (YoY)", "date": "2026-03-17", "time": "08:30", "timezone": "America/New_York", "impact": "high", "previous": "3.1%", "forecast": "2.9%", "actual": null, "country": "US"}`
-  - `title: "Upcoming: FOMC Rate Decision — Mar 19 14:00 ET"`, `body: {"event": "FOMC Rate Decision", "date": "2026-03-19", "time": "14:00", "timezone": "America/New_York", "impact": "high", "previous": "4.50%", "forecast": "4.50%", "actual": null}`
-- `source_id`: `"econ-cal-CPI-YoY-2026-03-17"`
+**Primary table: `econ_calendar`** (UUID primary key)
+- `id` UUID PK
+- `event_name` TEXT — e.g. `'CPI (YoY)'`, `'FOMC Rate Decision'`
+- `country` TEXT — e.g. `'US'`
+- `scheduled_at` TIMESTAMPTZ — date and time of the release
+- `impact` TEXT — `'high'`, `'medium'`, `'low'`
+- `previous` TEXT — previous release value
+- `forecast` TEXT — consensus forecast
+- `source_id` TEXT UNIQUE — dedup key, e.g. `'econ-cal-CPI-YoY-2026-03-17'`
+
+After each write, publishes to NATS JetStream subject `events.econ_calendar` with `{"id": "uuid", "table": "econ_calendar"}` payload.
 
 ---
 
@@ -306,7 +325,6 @@ After this phase:
 - [ ] Change detection generating events for significant indicator moves
 - [ ] Yield curve inversion alerts
 - [ ] `fed-watcher` monitoring Fed RSS feeds, FOMC calendar, FedWatch probabilities
-- [ ] Hawkish/dovish scoring on Fed speeches
 - [ ] Rate expectation tracking with shift detection
 - [ ] `econ-calendar` showing upcoming releases with dates, times, forecasts, impact levels
-- [ ] All macro, Fed, and calendar events flowing through `data_events` → NOTIFY → WebSocket
+- [ ] All macro, Fed, and calendar events published to NATS JetStream, consumed by api-gateway, pushed via WebSocket

@@ -1,8 +1,8 @@
-# 07 — Frontend
+# 06 — Frontend
 
 Svelte dashboard compiled to static HTML + JS. Real-time updates via WebSocket. No SSR, no Node in production.
 
-## 7.1 — Tech Setup
+## 6.1 — Tech Setup
 
 ### Build Pipeline
 - **Svelte 5** (runes mode) with **SvelteKit** in static adapter mode
@@ -24,9 +24,9 @@ frontend/
 │   ├── app.css               # Tailwind imports
 │   ├── lib/
 │   │   ├── stores/
-│   │   │   ├── events.js     # data_events store (WebSocket-fed)
-│   │   │   ├── snapshots.js  # market_snapshots store
-│   │   │   ├── filters.js    # active filters (ticker, category, urgency)
+│   │   │   ├── events.js     # event notifications store (WebSocket-fed)
+│   │   │   ├── snapshots.js  # market snapshots store (WebSocket-fed)
+│   │   │   ├── filters.js    # active filters (ticker, source_service, etc.)
 │   │   │   └── ws.js         # WebSocket connection manager
 │   │   ├── components/
 │   │   │   ├── EventCard.svelte
@@ -74,7 +74,7 @@ The `Dockerfile` builds the frontend as a build stage, then copies `build/` into
 
 ---
 
-## 7.2 — WebSocket Integration
+## 6.2 — WebSocket Integration
 
 ### Connection Manager (`ws.js`)
 
@@ -87,28 +87,25 @@ On close: auto-reconnect with exponential backoff (1s, 2s, 4s, 8s, max 30s)
 
 ### Message Format (from api-gateway)
 
+The api-gateway subscribes to NATS JetStream subjects and forwards messages to the frontend over WebSocket. The frontend has no knowledge of NATS — it only sees WebSocket JSON messages.
+
+**Event notifications** (from NATS subject `events.{table_name}`):
 ```json
 {
-  "channel": "data_events",
-  "payload": {
-    "id": 123,
-    "source_service": "news-aggregator",
-    "category": "news",
-    "urgency": "notable",
-    "title": "Fed raises rates by 25bp"
-  }
+  "subject": "events.congress_trades",
+  "id": "a1b2c3d4-...",
+  "table": "congress_trades"
 }
 ```
 
+**Snapshot updates** (from NATS subject `snapshots.{ticker}`):
 ```json
 {
-  "channel": "market_snapshots",
-  "payload": {
-    "id": 456,
-    "ticker": "SPY",
-    "price": 520.50,
-    "change_pct": -1.2
-  }
+  "subject": "snapshots.SPY",
+  "id": "e5f6a7b8-...",
+  "ticker": "SPY",
+  "price": 520.50,
+  "change_pct": -1.2
 }
 ```
 
@@ -116,12 +113,12 @@ On close: auto-reconnect with exponential backoff (1s, 2s, 4s, 8s, max 30s)
 
 WebSocket messages update Svelte stores. Components reactively re-render.
 
-- `data_events` messages → prepend to `$events` store (capped at 500 items in memory)
-- `market_snapshots` messages → upsert in `$snapshots` store (keyed by ticker)
+- **Event notifications** (`events.*` messages) → prepend to `$events` store (capped at 500 items in memory). Each notification is a pointer containing only `table` and `id`. The frontend fetches the actual displayable content (title, body, etc.) from the REST API (e.g., `GET /api/{table}/{id}`).
+- **Snapshot updates** (`snapshots.*` messages) → upsert in `$snapshots` store (keyed by ticker). Snapshot data is inline in the message (price, change_pct, etc.) — no additional fetch needed.
 
 ---
 
-## 7.3 — Pages
+## 6.3 — Pages
 
 ### Dashboard (`/`)
 
@@ -140,13 +137,13 @@ The main overview page. Shows everything at a glance.
 │        │ └──────────┘ └──────────┘ └──────────┘│
 │ (nav)  ├────────────────────────────────────────┤
 │        │ LIVE EVENT FEED                        │
-│        │ [filter: category | urgency | ticker]  │
+│        │ [filter: source | ticker]               │
 │        │                                        │
-│        │ ● ALERT: Fed raises rates by 25bp      │
-│        │ ● NOTABLE: NVDA insider buy $2M        │
-│        │ ○ Congress: Rep. X bought AAPL          │
-│        │ ○ CPI January: 3.1% YoY                │
-│        │ ○ GME short interest: 45% of float      │
+│        │ ● news-aggregator: Fed raises rates...   │
+│        │ ● insider-tracker: NVDA insider buy...  │
+│        │ ● congress-watcher: Rep. X bought AAPL  │
+│        │ ● macro-collector: CPI January: 3.1%... │
+│        │ ● market-data: GME short interest...     │
 │        │ ...                                     │
 └────────┴────────────────────────────────────────┘
 ```
@@ -154,9 +151,9 @@ The main overview page. Shows everything at a glance.
 **Components**:
 - `MarketTicker` — horizontal scrolling bar with major indices, commodities, crypto (from `$snapshots`)
 - `FearGreedGauge` — circular gauge showing CNN F&G score
-- `EventCard` — individual event with urgency indicator, category badge, timestamp, tags
-- `FilterBar` — filter events by category, urgency, ticker
-- Live feed auto-scrolls, new events slide in from top with subtle animation
+- `EventCard` — individual event notification showing source, timestamp, and resolved detail (fetched from REST API via table/id)
+- `FilterBar` — filter events by source service, ticker
+- Live feed receives NATS-forwarded event notifications via WebSocket, fetches detail from REST endpoints, auto-scrolls with new events sliding in from top with subtle animation
 
 ### Market (`/market`)
 
@@ -179,14 +176,13 @@ The main overview page. Shows everything at a glance.
 
 **Layout**: Scrollable feed of news cards with:
 - Source badge (Reuters, CNBC, Bloomberg, etc.)
-- Headline + summary
+- Headline + content preview
 - Related tickers (clickable → filter)
 - Timestamp
-- Urgency indicator
 
-**Filters**: Source, urgency, ticker, date range
+**Filters**: Source, ticker, date range
 
-**API call**: `GET /api/events?category=news&limit=50`
+**API call**: `GET /api/news_articles?limit=50` (fetched from the dedicated table directly, or resolved from event notifications via table/id)
 
 ### Options (`/options`)
 
@@ -204,7 +200,7 @@ The main overview page. Shows everything at a glance.
 **API calls**:
 - `GET /api/gamma?ticker=SPY` — latest gamma exposure
 - `GET /api/options?ticker=SPY` — options flow data
-- `GET /api/events?category=options` — unusual activity events
+- `GET /api/events?source_service=options-collector` — unusual activity notifications (detail resolved via table/id)
 
 ### Macro (`/macro`)
 
@@ -221,7 +217,7 @@ The main overview page. Shows everything at a glance.
 - **FedWatch**: Rate probability chart for next 3 meetings
 - **Economic Calendar**: Upcoming releases with dates and expectations
 
-**API call**: `GET /api/events?category=macro&limit=50`
+**API call**: `GET /api/events?source_service=macro-collector&limit=50` (detail resolved via table/id)
 
 ### Insider (`/insider`)
 
@@ -239,7 +235,7 @@ The main overview page. Shows everything at a glance.
 
 **Filters**: Trade type (buy/sell), role, amount range, party (Congress)
 
-**API call**: `GET /api/events?category=insider,political&limit=50`
+**API call**: `GET /api/events?source_service=insider-tracker,congress-watcher&limit=50` (detail resolved via table/id)
 
 ### Sentiment (`/sentiment`)
 
@@ -253,11 +249,22 @@ The main overview page. Shows everything at a glance.
 - **Put/Call Ratio**: Current value with historical context
 - **Reddit Buzz**: Top mentioned tickers with mention counts, sentiment score
 
-**API call**: `GET /api/events?category=sentiment&limit=50`
+**API call**: `GET /api/events?source_service=sentiment-collector&limit=50` (detail resolved via table/id)
 
 ---
 
-## 7.4 — Responsive Design
+## 6.4 — Timezone Handling
+
+All backend timestamps are UTC. The frontend handles all timezone conversion:
+
+- **Auto-detection**: On first load, detect timezone from `Intl.DateTimeFormat().resolvedOptions().timeZone`
+- **User override**: Settings panel lets user pick a timezone manually (stored in `localStorage`)
+- **Display**: All timestamps rendered through a shared `formatTime()` util that applies the active timezone
+- **Econ calendar**: Event times (e.g., "CPI release 08:30 ET") come with `timezone` field in the body JSONB — frontend converts to user's timezone
+
+---
+
+## 6.5 — Responsive Design
 
 - Desktop-first (primary use case: multi-monitor trading desk)
 - Tablet: sidebar collapses to icons
@@ -267,7 +274,7 @@ The main overview page. Shows everything at a glance.
 
 ---
 
-## 7.5 — Charting
+## 6.6 — Charting
 
 Use **Chart.js** or **Lightweight Charts** (TradingView open-source) for:
 - Gamma exposure bar charts
@@ -279,7 +286,7 @@ Preference: **Lightweight Charts** by TradingView for financial data (candlestic
 
 ---
 
-## 7.6 — Deliverables
+## 6.7 — Deliverables
 
 After this phase:
 - [ ] Svelte app builds to static files, served by api-gateway
