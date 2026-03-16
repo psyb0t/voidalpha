@@ -41,7 +41,7 @@ EU and Asia data source expansion comes later.
 
 Each service is a servicepack `internal/pkg/services/<name>/` service (`make service NAME=x`).
 Each implements `Service` interface (`Name()`, `Run(ctx)`, `Stop(ctx)`) with `New() (*T, error)` constructor.
-Optional: `Retryable`, `AllowedFailure`, `Dependent` interfaces for retry/deps/graceful degradation.
+Optional: `Retryable`, `AllowedFailure`, `Dependent`, `ReadyNotifier`, `Commander` interfaces for retry/deps/readiness/CLI commands.
 Each starts a Temporal worker internally for its own workflows.
 
 | Service | Data Niche | Sources |
@@ -97,7 +97,7 @@ Each starts a Temporal worker internally for its own workflows.
     - **Config**: `gonfiguration.Parse(&cfg)` with struct tags `env:"VAR_NAME"`. Defaults via `gonfiguration.SetDefaults()`. No manual `os.Getenv`.
     - **Env var naming**: `VOIDALPHA_SERVICENAME_PACKAGENAME_PROPERTYNAME` — underscores delimit app → service → package → field. Examples: `VOIDALPHA_APIGATEWAY_HTTP_LISTENADDRESS`, `VOIDALPHA_MARKETDATA_DB_CONNECTIONSTRING`, `VOIDALPHA_NEWSSAGGREGATOR_FINNHUB_APIKEY`. Shared/app-level vars drop the service: `VOIDALPHA_DB_CONNECTIONSTRING`, `VOIDALPHA_NATS_URL`.
     - **Environment**: `goenv.Get()` for dev/prod detection. No hand-rolled env checks.
-    - **Service pattern**: `ServiceName` const, `New() (*T, error)` constructor, implement `Service` interface. Optional `Retryable`, `AllowedFailure`, `Dependent`.
+    - **Service pattern**: `ServiceName` const, `New() (*T, error)` constructor, implement `Service` interface. Optional `Retryable`, `AllowedFailure`, `Dependent`, `ReadyNotifier`, `Commander`.
     - **Return early**, no if-else chains. `continue` in loops, `break` in selects/switches.
     - **No stdlib duplication** — if servicepack already provides a capability (config, errors, logging, env), use the servicepack way. Don't import competing libraries.
 

@@ -50,9 +50,25 @@ type AllowedFailure interface {
 type Dependent interface {
     Dependencies() []string  // other service names
 }
+
+// ReadyNotifier — signal when actually ready to serve
+// Service manager waits for Ready() before starting dependents.
+// Services without this are considered ready on goroutine launch.
+type ReadyNotifier interface {
+    Ready() <-chan struct{}
+}
+
+// Commander — expose CLI subcommands under ./app <servicename> <subcommand>
+type Commander interface {
+    Commands() []*cobra.Command
+}
 ```
 
-The service manager resolves dependencies via topological sort, starts services in groups (same group = concurrent), shuts down in reverse order, and recovers panics.
+The service manager resolves dependencies via topological sort, starts services in groups (same group = concurrent), waits for `ReadyNotifier` before launching dependents, shuts down in reverse order, and recovers panics.
+
+**Custom CLI hooks** (never touched by framework updates):
+- `cmd/init.go` — run setup before app starts (e.g. register Loki slog handler)
+- `cmd/commands.go` — add standalone CLI commands (e.g. `./app seed`, `./app migrate`). Returns `[]*cobra.Command`.
 
 **Core deps**: `ctxerrors` (error wrapping), `goenv` (dev/prod detection), `gonfiguration` (env var config parsing), `slog-configurator` (log setup), `cobra` (CLI).
 
